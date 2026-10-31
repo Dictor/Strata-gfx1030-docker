@@ -1,0 +1,206 @@
+# syntax=docker/dockerfile:1
+#
+# Strata v0.2.9 (Engine 0.1.55): Qwen3.8-Flash-Next on AMD RDNA2 (gfx1030) - Multi-Stage Lightweight Dockerfile
+# Includes all latest gfx1030 kernels, official Model Card sampling, and Auto-RAM Booster v4.
+#
+
+# ==========================================
+# Stage 1: Build the Strata HIP Engine
+# ==========================================
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libatomic1 libgomp1 libnuma1 \
+        python3 python3-pip python3-venv ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/strata
+COPY . .
+
+ARG HIP_ARCHITECTURES=gfx1030
+ARG BUILD_VISION=0
+
+RUN python3 -m venv .venv \
+    && .venv/bin/pip install --no-cache-dir --upgrade pip \
+    && .venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-build.txt \
+    && chmod +x setup.sh docker-entrypoint.sh entrypoint-ram.sh
+
+# Build Strata HIP engine for gfx1030 with K-quant MMQ and prompt optimizations
+RUN .venv/bin/python - <<'PYEOF'
+import os
+import setup
+
+llama = setup.get_llama_cpp()
+archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1030").replace(",", ";").split(";") if a]
+vision = "none"
+
+gpu = {"index": 0, "name": "AMD Radeon RX 6000 (gfx1030)", "vram_gb": 16.0,
+       "arch": archs[0], "archs": archs, "driver": "hip", "vendor": "amd"}
+setup.build_engine_hip(gpu, llama, vision)
+PYEOF
+
+# Collect runtime shared libraries from the installed ROCm wheel directories into /opt/rocm-runtime/lib
+RUN python3 - <<'PYEOF'
+import json, os, pathlib, shutil
+
+build_json = pathlib.Path("/opt/strata/engine/BUILD.json")
+if not build_json.exists():
+    raise RuntimeError("BUILD.json not found! Engine compilation failed.")
+
+meta = json.loads(build_json.read_text(encoding="utf-8"))
+dest = pathlib.Path("/opt/rocm-runtime/lib")
+dest.mkdir(parents=True, exist_ok=True)
+
+# Copy libraries from lib_dirs
+for lib_dir_str in meta.get("lib_dirs", []):
+    lib_dir = pathlib.Path(lib_dir_str)
+    if lib_dir.is_dir():
+        for item in lib_dir.iterdir():
+            target = dest / item.name
+            if item.is_symlink():
+                link_target = os.readlink(item)
+                if not target.exists():
+                    os.symlink(link_target, target)
+            elif item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            elif item.is_file():
+                shutil.copy2(item, target)
+
+# Ensure rocm-core and other critical libraries from sys.prefix are included
+for sp in pathlib.Path("/opt/strata/.venv/lib").glob("python*/site-packages/_rocm_sdk*"):
+    lib_dir = sp / "lib"
+    if lib_dir.is_dir():
+        for item in lib_dir.iterdir():
+            target = dest / item.name
+            if not target.exists():
+                if item.is_symlink():
+                    os.symlink(os.readlink(item), target)
+                elif item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                elif item.is_file():
+                    shutil.copy2(item, target)
+
+print("Runtime libraries collected successfully to", dest)
+PYEOF
+
+
+# ==========================================
+# Stage 2: Minimal Runtime Image
+# ==========================================
+FROM ubuntu:24.04 AS runner
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl libatomic1 libgomp1 libnuma1 \
+        python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/strata
+
+# 1. Copy application files and source tree
+COPY requirements.txt /opt/strata/requirements.txt
+COPY requirements-build.txt /opt/strata/requirements-build.txt
+COPY CMakeLists.txt /opt/strata/CMakeLists.txt
+COPY cmake /opt/strata/cmake
+COPY src /opt/strata/src
+COPY include /opt/strata/include
+COPY serve /opt/strata/serve
+COPY tools /opt/strata/tools
+COPY data /opt/strata/data
+COPY strata_control /opt/strata/strata_control
+COPY strata_cli /opt/strata/strata_cli
+COPY packaging /opt/strata/packaging
+COPY bin /opt/strata/bin
+COPY setup.py /opt/strata/setup.py
+COPY setup.sh /opt/strata/setup.sh
+COPY strata.py /opt/strata/strata.py
+COPY chat.py /opt/strata/chat.py
+COPY highlight.py /opt/strata/highlight.py
+COPY docker-entrypoint.sh /opt/strata/docker-entrypoint.sh
+COPY entrypoint-ram.sh /opt/strata/entrypoint-ram.sh
+
+# 2. Copy compiled engine, third_party and ROCm libraries from builder
+COPY --from=builder /opt/strata/engine /opt/strata/engine
+COPY --from=builder /opt/strata/third_party /opt/strata/third_party
+COPY --from=builder /opt/rocm-runtime/lib /opt/rocm/lib
+
+RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
+ENV LD_LIBRARY_PATH=/opt/rocm/lib
+
+# 3. Install runtime Python environment (no compiler / dev packages)
+RUN python3 -m venv .venv \
+    && .venv/bin/pip install --no-cache-dir --upgrade pip \
+    && .venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /root/.cache/pip
+
+# 4. Record installed pip packages in .venv/.strata-pip.json and .os so Step 3 is skipped at container startup
+RUN .venv/bin/python - <<'PYEOF'
+import json, pathlib, sys
+import setup
+stamp = pathlib.Path("/opt/strata/.venv/.strata-pip.json")
+pkgs = setup.requirement_lines() if setup.REQUIREMENTS.exists() else setup.PY_PACKAGES
+stamp.write_text(json.dumps(sorted(set(pkgs)), indent=0), encoding="utf-8")
+stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
+print(".strata-pip.json recorded with packages:", len(pkgs))
+PYEOF
+
+# 5. Configure BUILD.json and verify engine_ok check
+RUN .venv/bin/python - <<'PYEOF'
+import json, pathlib
+import setup
+
+stamp = pathlib.Path("/opt/strata/engine/BUILD.json")
+if not stamp.exists():
+    raise RuntimeError("BUILD.json not found! Engine compilation failed.")
+
+meta = json.loads(stamp.read_text(encoding="utf-8"))
+meta["lib_dirs"] = ["/opt/rocm/lib"]
+
+# Ensure source hash matches current runner files
+src_hash = setup.source_hash(setup.ENGINE_SOURCES)
+meta["src"] = src_hash
+
+# Ensure archs includes gfx1030
+archs = meta.get("archs", [])
+if "gfx1030" not in archs:
+    archs.append("gfx1030")
+meta["archs"] = sorted(set(archs))
+
+stamp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+print(f"Configured BUILD.json: src={src_hash}, archs={meta['archs']}, lib_dirs={meta['lib_dirs']}")
+
+# Rigorous verification: simulate setup.py's build_engine_hip check
+eng = setup.ROOT / "engine"
+test_archs = ["gfx1030"]
+has_archs = set(test_archs) <= set(setup.arch_names(meta.get("archs", [])))
+floor = setup.cpu_floor(setup.cpu_info()[1])
+engine_ok = (
+    meta.get("backend") == "hip"
+    and (eng / setup.EXE).exists()
+    and meta.get("src") == src_hash
+    and has_archs
+    and (meta.get("isa_floor") or "") == floor
+    and not setup.stale_binary(eng / setup.EXE)
+)
+vision_ok = True
+print(f"Pre-flight verification: engine_ok={engine_ok}, vision_ok={vision_ok}, version={meta.get('version')}")
+assert engine_ok and vision_ok, f"Pre-flight engine verification failed! meta={meta}"
+PYEOF
+
+# 6. Verify dynamic library linkage of the engine
+RUN ldd /opt/strata/engine/strata && \
+    (! ldd /opt/strata/engine/strata | grep -i "not found") || \
+    (echo "ERROR: Unresolved shared libraries in engine!" && exit 1)
+
+RUN chmod +x /opt/strata/setup.sh /opt/strata/docker-entrypoint.sh /opt/strata/entrypoint-ram.sh
+
+VOLUME ["/data"]
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+  CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+
+ENTRYPOINT ["./entrypoint-ram.sh"]
