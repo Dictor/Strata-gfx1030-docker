@@ -5,16 +5,16 @@
   </picture>
 </p>
 
-## AMD RDNA2 (`gfx1030`) Custom Docker Branch (`rdna2-gfx1030-opt`)
+## Strata docker image for AMD RDNA2 (`gfx1030`)
 
 This branch builds on upstream **Strata v0.2.9 (Engine 0.1.55)** and provides a lightweight, production-ready Docker deployment tailored for **AMD RDNA2 (`gfx1030` — RX 6800 / 6900 XT / Radeon PRO W6800)** on Linux and Unraid servers.
 
 ### Key Differences from Upstream Strata
 
-1. **Multi-Stage Lightweight HIP Dockerfile (`Dockerfile.gfx1030`)**
+1. **It's docker image based on HIP (`Dockerfile.gfx1030`)**
    - Compiles the native HIP engine (`strata` `0.1.55`) specifically for `gfx1030` with K-quant MMQ prompt kernels (`-DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_Q6K_EXPERTS=ON`).
    - Strips out the ROCm compiler/LLVM build toolchain in Stage 2 (`runner`), keeping only the runtime shared libraries (`/opt/rocm/lib`) and pre-verifying `BUILD.json` source hashes and `ldd` linkage so the container never attempts to recompile at startup.
-2. **Auto-RAM Booster Entrypoint v4 (`entrypoint-ram.sh`)**
+2. **Pin shard 2 to RAM for minimizing disk io (`entrypoint-ram.sh`)**
    - **Unified RAM Shard Directory (`/dev/shm/gguf`):** Automatically caches Shard 2 (the 27.5 GB PLE table, `*-00002-of-*.gguf`) into `tmpfs` (`/dev/shm/gguf`) to eliminate HDD/array random-read stalls, while symlinking Shard 1 (`0 MB` extra RAM used) in the same directory so Strata's multi-shard validator sees a unified path.
    - **Stage-0 MTP Drafter Provisioning:** Automatically copies `/opt/strata/data/draft_vocab.bin` into `/data/mtp/rt/` so `STRATA_MTP_STAGE0=1` places the MTP draft chain on the first stage's GPU during 2-GPU pipelined decoding (`--pipeline-windows 2`).
    - **Automatic Config Injection:** Safely updates `/data/config/strata-*.json` at startup with `/dev/shm/gguf` paths, official Qwen3.8 sampling defaults, and `gfx1030` kernel switches.
