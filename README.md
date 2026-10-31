@@ -5,6 +5,27 @@
   </picture>
 </p>
 
+## AMD RDNA2 (`gfx1030`) Custom Docker Branch (`rdna2-gfx1030-opt`)
+
+This branch builds on upstream **Strata v0.2.9 (Engine 0.1.55)** and provides a lightweight, production-ready Docker deployment tailored for **AMD RDNA2 (`gfx1030` — RX 6800 / 6900 XT / Radeon PRO W6800)** on Linux and Unraid servers.
+
+### Key Differences from Upstream Strata
+
+1. **Multi-Stage Lightweight HIP Dockerfile (`Dockerfile.gfx1030`)**
+   - Compiles the native HIP engine (`strata` `0.1.55`) specifically for `gfx1030` with K-quant MMQ prompt kernels (`-DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_Q6K_EXPERTS=ON`).
+   - Strips out the ROCm compiler/LLVM build toolchain in Stage 2 (`runner`), keeping only the runtime shared libraries (`/opt/rocm/lib`) and pre-verifying `BUILD.json` source hashes and `ldd` linkage so the container never attempts to recompile at startup.
+2. **Auto-RAM Booster Entrypoint v4 (`entrypoint-ram.sh`)**
+   - **Unified RAM Shard Directory (`/dev/shm/gguf`):** Automatically caches Shard 2 (the 27.5 GB PLE table, `*-00002-of-*.gguf`) into `tmpfs` (`/dev/shm/gguf`) to eliminate HDD/array random-read stalls, while symlinking Shard 1 (`0 MB` extra RAM used) in the same directory so Strata's multi-shard validator sees a unified path.
+   - **Stage-0 MTP Drafter Provisioning:** Automatically copies `/opt/strata/data/draft_vocab.bin` into `/data/mtp/rt/` so `STRATA_MTP_STAGE0=1` places the MTP draft chain on the first stage's GPU during 2-GPU pipelined decoding (`--pipeline-windows 2`).
+   - **Automatic Config Injection:** Safely updates `/data/config/strata-*.json` at startup with `/dev/shm/gguf` paths, official Qwen3.8 sampling defaults, and `gfx1030` kernel switches.
+3. **Lossless Speculative Sampling & `gfx1030` Kernel Defaults**
+   - Enables official sampling defaults (`temperature: 0.8`, `top_p: 0.95`, `top_k: 20`, `presence_penalty: 0.6`) alongside exact speculative rejection sampling (`STRATA_SPEC_PROB=1`, `STRATA_SPEC_PROB_GATE=top`) to prevent greedy-decoding CJK token bleed without sacrificing MTP speed.
+   - Pre-configures RDNA2-tuned environment switches: `STRATA_HIP_PROMPT_F16=1`, `STRATA_ROCBLAS_TUNING=/opt/strata/tools/hip`, `STRATA_SH_STREAM=1`, `STRATA_DENSE_MMQ=1`, `STRATA_SELECT_SIMT=1`, `STRATA_PLE_COMPACT=1`, `STRATA_HC_PERSIST=1`, `STRATA_MTP_STAGE0=1`, `STRATA_EXPDEC=1`, and `STRATA_QSA_ROWS=1`.
+4. **Unraid `/data/config` Compatibility (`docker-entrypoint.sh`)**
+   - Preserves direct `/data/config/strata-<model>.json` compatibility without forcing directory layout migrations or mandatory API keys on local LAN deployments.
+
+---
+
 <h3 align="center">Run powerful AI on your own computer.</h3>
 <p align="center">Chat, code and work with images, locally.</p>
 
@@ -210,4 +231,3 @@ Thank you to everyone who supports Strata.
 <sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
 
 **Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
