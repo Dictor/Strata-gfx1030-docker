@@ -41,6 +41,83 @@ gpu = {"index": 0, "name": "AMD Radeon RX 6000 (gfx1030)", "vram_gb": 16.0,
 setup.build_engine_hip(gpu, llama, vision)
 PYEOF
 
+# Build portable (AVX2 baseline) CPU & HIP vision encoders (strata-vision & strata-vision-hip)
+RUN .venv/bin/python - <<'PYEOF'
+import json, os, pathlib, shutil
+import setup
+
+eng = setup.ROOT / "engine"
+stamp = eng / "BUILD.json"
+meta = json.loads(stamp.read_text(encoding="utf-8"))
+llama = setup.get_llama_cpp()
+vsrc = setup.source_hash(setup.VISION_SOURCES)
+archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1030").replace(",", ";").split(";") if a]
+
+# 1. Build portable AVX2 CPU vision encoder (strata-vision) so older AVX2 host CPUs never hit SIGILL
+setup.cmake_build(
+    setup.ROOT / "tools" / "vision",
+    setup.ROOT / "build-vision",
+    "strata-vision",
+    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=ON"],
+    None,
+    "",
+)
+shutil.copy2(setup.ROOT / "build-vision" / "bin" / setup.VEXE, eng / setup.VEXE)
+
+# 2. Build portable AVX2 + HIP GPU vision encoder (strata-vision-hip) for gfx1030
+try:
+    root, dirs = setup.rocm_root(archs)
+    libs = [str(pathlib.Path(d).parent) for d in dirs[1:]]
+    bitcode = next(
+        (p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode") if p.is_dir()),
+        root / "amdgcn" / "bitcode",
+    )
+    os.environ.update({
+        "HIP_PLATFORM": "amd",
+        "HIP_COMPILER": "clang",
+        "HIP_RUNTIME": "rocclr",
+        "ROCM_PATH": str(root),
+        "HIP_PATH": str(root),
+    })
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+
+    setup.cmake_build(
+        setup.ROOT / "tools" / "vision",
+        setup.ROOT / "build-vision-hip",
+        "strata-vision",
+        [
+            f"-DLLAMA_DIR={llama}",
+            "-DSTRATA_VISION_HIP=ON",
+            "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
+            "-DSTRATA_PORTABLE=ON",
+            f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+            f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+            "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
+            f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
+        ],
+        None,
+        "",
+    )
+    shutil.copy2(setup.ROOT / "build-vision-hip" / "bin" / setup.HVEXE, eng / setup.HVEXE)
+    meta.update({
+        "vision": "gpu",
+        "vision_archs": archs,
+        "vision_gpu": setup.HVEXE,
+    })
+    print("Built GPU vision encoder:", eng / setup.HVEXE)
+except Exception as e:
+    print(f"Warning: GPU vision encoder build skipped ({e}); using CPU vision encoder only.")
+    meta["vision"] = "cpu"
+
+meta.update({
+    "vision_src": vsrc,
+    "vision_cpu": setup.VEXE,
+})
+stamp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+print("Vision setup complete: mode =", meta.get("vision"))
+PYEOF
+
 # Collect runtime shared libraries from the installed ROCm wheel directories into /opt/rocm-runtime/lib
 RUN python3 - <<'PYEOF'
 import json, os, pathlib, shutil
@@ -161,16 +238,19 @@ meta["lib_dirs"] = ["/opt/rocm/lib"]
 
 # Ensure source hash matches current runner files
 src_hash = setup.source_hash(setup.ENGINE_SOURCES)
+vsrc_hash = setup.source_hash(setup.VISION_SOURCES)
 meta["src"] = src_hash
+meta["vision_src"] = vsrc_hash
 
 # Ensure archs includes gfx1030
 archs = meta.get("archs", [])
 if "gfx1030" not in archs:
     archs.append("gfx1030")
 meta["archs"] = sorted(set(archs))
+meta["vision_archs"] = sorted(set(archs))
 
 stamp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-print(f"Configured BUILD.json: src={src_hash}, archs={meta['archs']}, lib_dirs={meta['lib_dirs']}")
+print(f"Configured BUILD.json: src={src_hash}, vision_src={vsrc_hash}, archs={meta['archs']}, lib_dirs={meta['lib_dirs']}")
 
 # Rigorous verification: simulate setup.py's build_engine_hip check
 eng = setup.ROOT / "engine"
@@ -185,15 +265,23 @@ engine_ok = (
     and (meta.get("isa_floor") or "") == floor
     and not setup.stale_binary(eng / setup.EXE)
 )
-vision_ok = True
+vision_ok = (
+    (eng / setup.VEXE).exists()
+    and meta.get("vision_src") == vsrc_hash
+    and (meta.get("vision") != "gpu" or ((eng / setup.HVEXE).exists() and set(test_archs) <= set(setup.arch_names(meta.get("vision_archs", [])))))
+)
 print(f"Pre-flight verification: engine_ok={engine_ok}, vision_ok={vision_ok}, version={meta.get('version')}")
 assert engine_ok and vision_ok, f"Pre-flight engine verification failed! meta={meta}"
 PYEOF
 
-# 6. Verify dynamic library linkage of the engine
+# 6. Verify dynamic library linkage of the engine and vision encoders
 RUN ldd /opt/strata/engine/strata && \
-    (! ldd /opt/strata/engine/strata | grep -i "not found") || \
-    (echo "ERROR: Unresolved shared libraries in engine!" && exit 1)
+    ldd /opt/strata/engine/strata-vision && \
+    ([ ! -f /opt/strata/engine/strata-vision-hip ] || ldd /opt/strata/engine/strata-vision-hip) && \
+    (! ldd /opt/strata/engine/strata | grep -i "not found") && \
+    (! ldd /opt/strata/engine/strata-vision | grep -i "not found") && \
+    ([ ! -f /opt/strata/engine/strata-vision-hip ] || ! ldd /opt/strata/engine/strata-vision-hip | grep -i "not found") || \
+    (echo "ERROR: Unresolved shared libraries in engine or vision encoder!" && exit 1)
 
 RUN chmod +x /opt/strata/setup.sh /opt/strata/docker-entrypoint.sh /opt/strata/entrypoint-ram.sh
 
