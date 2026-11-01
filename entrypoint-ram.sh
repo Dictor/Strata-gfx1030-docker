@@ -78,12 +78,17 @@ default_env = {
     "STRATA_DENSE_MMQ": "1",
     "STRATA_SELECT_SIMT": "1",
     "STRATA_PLE_COMPACT": "1",
-    "STRATA_HC_PERSIST": "1",
-    "STRATA_MTP_STAGE0": "1",
+    "STRATA_HC_PERSIST": "0",
+    "STRATA_MTP_STAGE0": "0",
+    "STRATA_SPLIT_OVERLAP": "1",
     "STRATA_EXPDEC": "1",
     "STRATA_QSA_ROWS": "1",
     "STRATA_SPEC_PROB": "1",
     "STRATA_SPEC_PROB_GATE": "top",
+    "STRATA_PREFILL_WARM": "0",
+    "STRATA_ARENA_PIN_GIB": "8",
+    "STRATA_NO_ARENA_THP": "1",
+    "STRATA_ARENA_LOCK": "0",
 }
 
 default_sampling = {
