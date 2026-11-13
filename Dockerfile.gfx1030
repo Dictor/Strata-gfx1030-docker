@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# Strata v0.2.9 (Engine 0.1.55): Qwen3.8-Flash-Next on AMD RDNA2 (gfx1030) - Multi-Stage Lightweight Dockerfile
-# Includes all latest gfx1030 kernels, official Model Card sampling, and Auto-RAM Booster v4.
+# Strata v0.2.13 (Engine 0.1.59.1): Qwen3.8-Flash-Next on AMD RDNA2 (gfx1030) - Multi-Stage Lightweight Dockerfile
+# Includes all latest gfx1030 kernels, official Model Card sampling, and Auto-RAM Booster v5.
 #
 
 # ==========================================
@@ -180,6 +180,7 @@ WORKDIR /opt/strata
 # 1. Copy application files and source tree
 COPY requirements.txt /opt/strata/requirements.txt
 COPY requirements-build.txt /opt/strata/requirements-build.txt
+COPY requirements-monitor.txt /opt/strata/requirements-monitor.txt
 COPY CMakeLists.txt /opt/strata/CMakeLists.txt
 COPY cmake /opt/strata/cmake
 COPY src /opt/strata/src
@@ -187,6 +188,9 @@ COPY include /opt/strata/include
 COPY serve /opt/strata/serve
 COPY tools /opt/strata/tools
 COPY data /opt/strata/data
+COPY ref /opt/strata/ref
+COPY bench/prompts /opt/strata/bench/prompts
+COPY docs/MANAGEMENT_PROTOCOL.md docs/TERMINAL_LAUNCH.md /opt/strata/docs/
 COPY strata_control /opt/strata/strata_control
 COPY strata_cli /opt/strata/strata_cli
 COPY packaging /opt/strata/packaging
@@ -194,8 +198,6 @@ COPY bin /opt/strata/bin
 COPY setup.py /opt/strata/setup.py
 COPY setup.sh /opt/strata/setup.sh
 COPY strata.py /opt/strata/strata.py
-COPY chat.py /opt/strata/chat.py
-COPY highlight.py /opt/strata/highlight.py
 COPY docker-entrypoint.sh /opt/strata/docker-entrypoint.sh
 COPY entrypoint-ram.sh /opt/strata/entrypoint-ram.sh
 
